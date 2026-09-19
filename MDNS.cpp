@@ -31,7 +31,7 @@ extern "C" {
 }
 
 #include "MDNS.h"
-
+static int cimemcmp(const void *s1, const void *s2, size_t n);
 #define  MDNS_DEFAULT_NAME       "arduino"
 #define  MDNS_TLD                ".local"
 #define  DNS_SD_SERVICE          "_services._dns-sd._udp.local"
@@ -564,105 +564,135 @@ MDNSError_t MDNS::_processMDNSQuery()
       uint8_t* buf = (uint8_t*)dnsHeader;
       int rLen = 0, tLen = 0;
 
-      // read over the query section 
-      for (i=0; i<qCnt; i++) {         
-         // construct service name data structures for comparison
-         const uint8_t* servNames[NumMDNSServiceRecords+2];
-         int servLens[NumMDNSServiceRecords+2];
-         uint8_t servNamePos[NumMDNSServiceRecords+2];
-         uint8_t servMatches[NumMDNSServiceRecords+2];
-         
-         // first entry is our own MDNS name, the rest are our services
-         servNames[0] = (const uint8_t*)this->_name;
-         servNamePos[0] = 0;
-         servLens[0] = strlen((char*)this->_name);
-         servMatches[0] = 1;
-         
-         // second entry is our own the general DNS-SD service
-         servNames[1] = (const uint8_t*)DNS_SD_SERVICE;
-         servNamePos[1] = 0;
-         servLens[1] = strlen((char*)DNS_SD_SERVICE);
-         servMatches[1] = 1;
-                  
-         for (j=2; j<NumMDNSServiceRecords+2; j++)
-            if (NULL != this->_serviceRecords[j-2] && NULL != this->_serviceRecords[j-2]->servName) {
-               servNames[j] = this->_serviceRecords[j-2]->servName;
-               servLens[j] = strlen((char*)servNames[j]);
-               servMatches[j] = 1;
-               servNamePos[j] = 0;
-            } else {
-               servNames[j] = NULL;
-               servLens[j] = 0;
-               servMatches[j] = 0;
-               servNamePos[j] = 0;
+      // read over the query section.
+      // Decode RFC 1035 compressed QNAMEs properly. Apple mDNSResponder often
+      // puts several questions in one packet and compresses later QNAMEs.
+      for (i=0; i<qCnt; i++) {
+         char qName[256];
+         int qNameLen = 0;
+         int nameOffset = offset;
+         int nextOffset = offset;
+         int jumps = 0;
+         bool jumped = false;
+         bool malformed = false;
+
+         while (1) {
+            if (nameOffset < 0 || nameOffset >= udp_len) {
+               malformed = true;
+               break;
             }
-   
-         tLen = 0;
-         do {
 
-        	memcpy((uint8_t*)buf, (uint16_t*)(ptr+offset) ,1);
-            offset += 1;
+            uint8_t len = udpBuffer[nameOffset++];
 
-            rLen = buf[0];
-            tLen += 1;
-            
-            if (rLen > 128) {// handle DNS name compression, kinda, sorta
-
-
-            	memcpy((uint8_t*)buf, (uint16_t*)(ptr+offset) ,1);
-            	offset += 1;
-               
-               for (j=0; j<NumMDNSServiceRecords+2; j++) {
-                  if (servNamePos[j] && servNamePos[j] != buf[0]) {
-                     servMatches[j] = 0;
-                  }
-               }
-               
-               tLen += 1;
-            } else if (rLen > 0) {
-               int tr = rLen, ir;
-               
-               while (tr > 0) {
-                  ir = (tr > (int)sizeof(DNSHeader_t)) ? sizeof(DNSHeader_t) : tr;
-
-                  memcpy((uint8_t*)buf, (uint16_t*)(ptr+offset) ,ir);
-                  offset += ir;
-                  tr -= ir;
-                  
-                  for (j=0; j<NumMDNSServiceRecords+2; j++) {
-                     if (!recordsAskedFor[j] && servMatches[j])
-                        servMatches[j] &= this->_matchStringPart(&servNames[j], &servLens[j], buf,
-                                                                 ir);
-                  }
-               }
-               
-               tLen += rLen;
+            if (0 == len) {
+               if (!jumped)
+                  nextOffset = nameOffset;
+               break;
             }
-         } while (rLen > 0 && rLen <= 128);
 
-         // if this matched a name of ours (and there are no characters left), then
-         // check whether this is an A record query (for our own name) or a PTR record query
-         // (for one of our services).
-         // if so, we'll note to send a record
+            if (0xC0 == (len & 0xC0)) {
+               if (nameOffset >= udp_len) {
+                  malformed = true;
+                  break;
+               }
 
-         memcpy((uint8_t*)buf, (uint16_t*)(ptr+offset) ,4);
+               uint16_t compressionOffset =
+                  ((uint16_t)(len & 0x3F) << 8) | udpBuffer[nameOffset++];
+
+               if (!jumped) {
+                  nextOffset = nameOffset; // bytes consumed in original QNAME
+                  jumped = true;
+               }
+
+               if (++jumps > 16 || compressionOffset >= udp_len) {
+                  malformed = true;
+                  break;
+               }
+
+               nameOffset = compressionOffset;
+               continue;
+            }
+
+            if (len & 0xC0 || nameOffset + len > udp_len) {
+               malformed = true;
+               break;
+            }
+
+            if (qNameLen) {
+               if (qNameLen >= (int)sizeof(qName)-1) {
+                  malformed = true;
+                  break;
+               }
+               qName[qNameLen++] = '.';
+            }
+
+            if (qNameLen + len >= (int)sizeof(qName)) {
+               malformed = true;
+               break;
+            }
+
+            memcpy(&qName[qNameLen], &udpBuffer[nameOffset], len);
+            qNameLen += len;
+            nameOffset += len;
+
+            if (!jumped)
+               nextOffset = nameOffset;
+         }
+
+         if (malformed || nextOffset + 4 > udp_len)
+            break;
+
+         qName[qNameLen] = '\0';
+         offset = nextOffset;
+
+         uint16_t qType = ((uint16_t)udpBuffer[offset] << 8) |
+                           udpBuffer[offset+1];
+         uint16_t qClass = ((uint16_t)udpBuffer[offset+2] << 8) |
+                            udpBuffer[offset+3];
          offset += 4;
-         
-         for (j=0; j<NumMDNSServiceRecords+2; j++) {
-            if (!recordsAskedFor[j] && servNames[j] && servMatches[j] && 0 == servLens[j]) {
-               if (0 == servNamePos[j])
-                  servNamePos[j] = offset - 4 - tLen;
-               
-               if (buf[0] == 0 && buf[3] == 0x01 &&
-                  (buf[2] == 0x00 || buf[2] == 0x80)) {
-                  
-                  if ((0 == j && 0x01 == buf[1]) || (0 < j && (0x0c == buf[1] || 0x10 == buf[1] || 0x21 == buf[1])))
-                     recordsAskedFor[j] = 1;
-                  else if (0 == j && 0x1c == buf[1])
-                     wantsIPv6Addr = 1;
+
+         // Top bit is the mDNS QU bit; the remaining class must be IN.
+         qClass &= 0x7FFF;
+         if (0x0001 != qClass)
+            continue;
+
+         size_t qNameLength = strlen(qName);
+         size_t myNameLength = strlen((char*)this->_name);
+
+         if (qNameLength == myNameLength &&
+             0 == cimemcmp(qName, this->_name, myNameLength)) {
+            if (0x0001 == qType)       // A
+               recordsAskedFor[0] = 1;
+            else if (0x001c == qType)  // AAAA
+               wantsIPv6Addr = 1;
+
+            continue;
+         }
+
+#if defined(HAS_SERVICE_REGISTRATION) && HAS_SERVICE_REGISTRATION
+         size_t dnsSdLength = strlen(DNS_SD_SERVICE);
+         if (0x000c == qType && qNameLength == dnsSdLength &&
+             0 == cimemcmp(qName, DNS_SD_SERVICE, dnsSdLength)) {
+            recordsAskedFor[1] = 1;
+            continue;
+         }
+
+         for (j=0; j<NumMDNSServiceRecords; j++) {
+            if (NULL != this->_serviceRecords[j] &&
+                NULL != this->_serviceRecords[j]->servName) {
+               const char* serviceName =
+                  (const char*)this->_serviceRecords[j]->servName;
+               size_t serviceNameLength = strlen(serviceName);
+
+               if (qNameLength == serviceNameLength &&
+                   0 == cimemcmp(qName, serviceName, serviceNameLength) &&
+                   (0x000c == qType || 0x0010 == qType || 0x0021 == qType)) {
+                  recordsAskedFor[j+2] = 1;
+                  break;
                }
             }
          }
+#endif
       }
    } 
    
